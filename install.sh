@@ -858,6 +858,7 @@ cmd_install() {
   # In native mode, use system Asterisk instead of building Docker image
   if [ "$ENGINE_MODE" = "native" ]; then
     ensure_asterisk
+    info "native engine mode — skipping Docker checks"
   else
     # Docker mode: ensure Docker and build engine image
     ensure_docker
