@@ -1,0 +1,36 @@
+lpac 2.3.0 pcsc driver: fix reader selection so multi-reader hosts work.
+
+Upstream pcsc_open_hCard_iter has two defects that together make lpac usable only
+on the FIRST PC/SC reader of a host:
+
+  1. LPAC_APDU_PCSC_DRV_NAME alone is never honoured: the name filter is evaluated
+     only inside the "interface id set and mismatched" branch, so with just the name
+     set lpac silently connects to reader index 0 (on this gateway that is a modem's
+     virtual VPCD slot, not the card the caller asked for -> "euicc_init" failures).
+  2. LPAC_APDU_PCSC_DRV_IFID=N (N != first index) crashes: the mismatch branch calls
+     strstr(reader, getenv(ENV_DRV_NAME)) with a NULL needle when the name env is not
+     set -> segmentation fault.
+
+Make the two selectors independent: an explicit interface id selects exactly that
+index; a name filter (substring match, as upstream intended) applies on its own.
+
+--- a/driver/apdu/pcsc.c
++++ b/driver/apdu/pcsc.c
+@@ -117,11 +117,13 @@
+     DWORD dwActiveProtocol;
+
+     const int id = getenv_or_default(ENV_DRV_IFID, (int)-1);
+     if (id != -1 && id != index) {
+-        const char *part_name = getenv(ENV_DRV_NAME);
+-        if (strstr(reader, part_name) == NULL) {
+-            return 0;
+-        }
++        return 0; // an explicit interface id selects exactly one reader
++    }
++
++    const char *part_name = getenv(ENV_DRV_NAME);
++    if (part_name != NULL && strstr(reader, part_name) == NULL) {
++        return 0; // reader name filter did not match this reader
+     }
+
+     if (is_ignored_reader_name(reader)) {

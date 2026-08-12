@@ -1,0 +1,8 @@
+diff --git a/readers/supported_readers.txt b/readers/supported_readers.txt
+index 02185f0..80fdb96 100644
+--- a/readers/supported_readers.txt
++++ b/readers/supported_readers.txt
+@@ -21,0 +22,3 @@
++# SCR
++0x04D9:0xC001:SCR Prime CCID Reader
++

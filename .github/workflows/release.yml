@@ -1,0 +1,58 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Verify tag and version
+        run: |
+          test "v$(tr -d '\n' < VERSION)" = "${GITHUB_REF_NAME}"
+          git diff --exit-code
+      - name: Test release source
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y swig libpcsclite-dev
+          python -m pip install -r control/requirements.txt
+          python -m py_compile control/app/*.py engine/*.py host/*.py
+          python -m unittest discover -s tests -v
+          sh -n install.sh engine/entrypoint.sh
+          cd webui
+          npm ci
+          npm audit --audit-level=high
+          npm run build
+      - name: Build control image and validate engine definition
+        run: |
+          docker build -f control/Dockerfile -t mdd-sim-gateway/control:${GITHUB_REF_NAME} .
+          # The clean target-ARM64 engine build is the manual gate documented in
+          # docs/RELEASE_CHECKLIST.md; hosted runners cannot reliably reach sysmocom.
+          docker build --check -f engine/Dockerfile engine
+      - name: Build checksummed source archive
+        run: |
+          archive="mdd-sim-gateway-${GITHUB_REF_NAME}.tar.gz"
+          staging="$(mktemp -d)"
+          root="$staging/mdd-sim-gateway-${GITHUB_REF_NAME}"
+          mkdir -p "$root"
+          git archive HEAD | tar -x -C "$root"
+          rm -rf "$root/webui/dist"
+          cp -a webui/dist "$root/webui/dist"
+          printf '%s\n' "$(cat VERSION)" > "$root/webui/dist/.mdd-release-version"
+          tar -czf "$archive" -C "$staging" "mdd-sim-gateway-${GITHUB_REF_NAME}"
+          sha256sum "$archive" > SHA256SUMS
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            "mdd-sim-gateway-${GITHUB_REF_NAME}.tar.gz" SHA256SUMS \
+            --verify-tag --generate-notes --title "MDD Sim Gateway ${GITHUB_REF_NAME}"

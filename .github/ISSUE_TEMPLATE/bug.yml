@@ -1,0 +1,33 @@
+name: Bug report
+description: Report a reproducible MDD Sim Gateway problem without subscriber data.
+title: "[Bug] "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Never include a PIN, IMSI, ICCID, EID, phone number, proxy URL or token.
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      placeholder: 1.0.0
+    validations:
+      required: true
+  - type: dropdown
+    id: hardware
+    attributes:
+      label: Hardware path
+      options: [Cellular modem, PC/SC reader, eUICC reader, Other]
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Reproduction and expected result
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Redacted diagnostics
+      description: Attach a reviewed support bundle if useful.

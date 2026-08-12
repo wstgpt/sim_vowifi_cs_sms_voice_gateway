@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 520" role="img" aria-label="MDD Sim Gateway architecture">
+  <style>.bg{fill:#081a29}.panel{fill:#0d293d;stroke:#27536d;stroke-width:2}.accent{fill:#123f59;stroke:#20d9ae;stroke-width:2}.t{fill:#f2f9fd;font:600 20px Arial}.s{fill:#9db6c5;font:15px Arial}.line{stroke:#3ca5dd;stroke-width:3;fill:none;marker-end:url(#a)}</style>
+  <defs><marker id="a" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0 0L9 3 0 6Z" fill="#3ca5dd"/></marker></defs>
+  <rect class="bg" width="1200" height="520" rx="24"/>
+  <rect class="panel" x="40" y="55" width="250" height="160" rx="18"/><text class="t" x="70" y="95">Physical devices</text><text class="s" x="70" y="130">Cellular modem · 4G + VoWiFi</text><text class="s" x="70" y="160">PC/SC reader · VoWiFi only</text><text class="s" x="70" y="190">SIM / eUICC stays authoritative</text>
+  <rect class="accent" x="430" y="35" width="330" height="205" rx="18"/><text class="t" x="465" y="78">MDD control plane</text><text class="s" x="465" y="115">Device discovery and state</text><text class="s" x="465" y="145">Authenticated bilingual Web UI</text><text class="s" x="465" y="175">Calls · SMS · eSIM · notifications</text><text class="s" x="465" y="205">Backups · diagnostics · updates</text>
+  <rect class="panel" x="900" y="55" width="250" height="160" rx="18"/><text class="t" x="930" y="95">Host services</text><text class="s" x="930" y="130">ModemManager / NetworkManager</text><text class="s" x="930" y="160">pcscd / virtual card bridge</text><text class="s" x="930" y="190">sing-box country TUNs</text>
+  <rect class="panel" x="160" y="335" width="300" height="130" rx="18"/><text class="t" x="195" y="378">Per-SIM VoWiFi engine</text><text class="s" x="195" y="413">SWu IKEv2/IPsec + Asterisk IMS</text><text class="s" x="195" y="440">Physical SIM performs AKA</text>
+  <rect class="panel" x="740" y="335" width="300" height="130" rx="18"/><text class="t" x="775" y="378">External networks</text><text class="s" x="775" y="413">Carrier 4G · ePDG · IMS</text><text class="s" x="775" y="440">Clash nodes · notification APIs</text>
+  <path class="line" d="M290 135H430"/><path class="line" d="M760 135H900"/><path class="line" d="M520 240L380 335"/><path class="line" d="M680 240L820 335"/><path class="line" d="M460 400H740"/>
+</svg>

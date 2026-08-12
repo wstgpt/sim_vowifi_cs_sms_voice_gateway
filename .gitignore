@@ -1,0 +1,54 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+.venv/
+*.egg-info/
+dist/
+build/
+
+# Docker
+.docker/
+*.tar
+*.tar.gz
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data files (contain sensitive info)
+data/
+!.gitkeep
+
+# Logs
+*.log
+logs/
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Screenshots (may contain sensitive info)
+screenshots/
+
+# Tests (optional, keep for development)
+# tests/
+
+# Local config
+control/.venv/
+
+# Node modules (if built locally)
+webui/node_modules/
+webui/dist/

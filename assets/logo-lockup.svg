@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 220" role="img" aria-label="MDD Sim Gateway">
+  <defs><linearGradient id="g" x1="24" y1="24" x2="196" y2="196" gradientUnits="userSpaceOnUse"><stop stop-color="#168CFF"/><stop offset="1" stop-color="#20D9AE"/></linearGradient></defs>
+  <rect width="900" height="220" rx="28" fill="#081A29"/>
+  <rect x="28" y="28" width="164" height="164" rx="38" fill="#0D293D" stroke="#25516A"/>
+  <path d="M56 153V67h20l34 43 34-43h20v86h-25v-45l-29 38-29-38v45H56Z" fill="url(#g)"/>
+  <text x="230" y="112" fill="#F4FBFF" font-family="Inter,Arial,sans-serif" font-size="52" font-weight="750">MDD Sim Gateway</text>
+  <text x="233" y="154" fill="#8EACBE" font-family="Inter,Arial,sans-serif" font-size="22">4G · Wi‑Fi Calling · SMS · eSIM · Multi‑SIM</text>
+</svg>
