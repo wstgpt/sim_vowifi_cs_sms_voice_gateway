@@ -1,0 +1,435 @@
+import tempfile
+import time
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
+
+from control.app import device_state
+from host.mdd_orchestrator import Orchestrator
+
+
+class DeviceStateTests(unittest.TestCase):
+    def test_native_reader_is_stable_and_never_collides_with_modem_vpcd_slots(self):
+        cards = [
+            {"name": "USB Smart Card Reader 00 00", "reader_port": "3-2",
+             "hardware_kind": "reader", "present": True},
+            {"name": "VPCD modem slot", "hardware_kind": "modem", "present": True},
+        ]
+        first = device_state.native_reader_devices(cards)
+        second = device_state.native_reader_devices(list(reversed(cards)))
+        self.assertEqual(first, second)
+        self.assertEqual(len(first), 1)
+        self.assertTrue(next(iter(first)).startswith("reader-"))
+
+    def test_native_reader_vowifi_state_is_independent_of_cellular(self):
+        self.assertEqual(device_state.native_vowifi_capability(False, False, None)["actual"], "off")
+        self.assertEqual(device_state.native_vowifi_capability(True, True, {"state": "OK"})["actual"], "on")
+        self.assertEqual(device_state.native_vowifi_capability(True, False, None)["actual"], "degraded")
+
+    def test_logical_channel_view_is_bounded_and_preserves_roles(self):
+        value = device_state.logical_channel_view({
+            "channel_capacity": 3, "channel_allocated": 3, "channel_status": "ready",
+            "logical_channels": [
+                {"slot": 0, "channel": 1, "role": "pin"},
+                {"slot": 1, "channel": 2, "role": "swu"},
+                {"slot": 2, "channel": 3, "role": "ims"},
+                {"slot": 3, "channel": 4, "role": "invalid"},
+            ],
+        }, True)
+        self.assertEqual(value["allocated"], 3)
+        self.assertEqual(value["capacity"], 3)
+        self.assertEqual(len(value["items"]), 3)
+        self.assertEqual(value["items"][1]["role"], "swu")
+
+    def test_legacy_channel_metadata_uses_bridge_state_without_inventing_ids(self):
+        value = device_state.logical_channel_view({"slots": 3}, True)
+        self.assertEqual(value["status"], "ready")
+        self.assertEqual(value["allocated"], 3)
+        self.assertEqual(value["items"], [])
+
+    def test_stale_ready_channel_metadata_cannot_claim_a_stopped_bridge(self):
+        value = device_state.logical_channel_view({
+            "channel_status": "ready", "channel_allocated": 3,
+            "logical_channels": [{"slot": 0, "channel": 1, "role": "pin"}],
+        }, False)
+        self.assertEqual(value["status"], "stopped")
+        self.assertEqual(value["allocated"], 0)
+        self.assertEqual(value["items"], [])
+
+    def test_one_device_update_preserves_other_device(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            with patch.multiple(device_state, ROOT=str(root),
+                                DESIRED=str(root / "desired.json"),
+                                STATUS=str(root / "status.json")):
+                device_state.set_desired("modem-a", cellular_enabled=True,
+                                         vowifi_enabled=False)
+                device_state.set_desired("modem-b", vowifi_enabled=True)
+                value = device_state.desired()["devices"]
+                self.assertEqual(value["modem-a"], {
+                    "cellular_enabled": True, "vowifi_enabled": False,
+                    "flight_mode": False})
+                self.assertEqual(value["modem-b"], {
+                    "cellular_enabled": False, "vowifi_enabled": True,
+                    "flight_mode": False})
+
+    def test_new_device_defaults_are_persisted_without_changing_existing_devices(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            with patch.multiple(device_state, ROOT=str(root),
+                                DESIRED=str(root / "desired.json"),
+                                STATUS=str(root / "status.json")):
+                device_state.set_desired("existing", cellular_enabled=False, vowifi_enabled=True)
+                device_state.set_defaults(cellular_enabled=True, vowifi_enabled=False)
+                value = device_state.desired()
+                self.assertEqual(value["defaults"], {
+                    "cellular_enabled": True, "vowifi_enabled": False,
+                    "flight_mode": False})
+                self.assertEqual(value["devices"]["existing"], {
+                    "cellular_enabled": False, "vowifi_enabled": True,
+                    "flight_mode": False})
+
+    def test_hardware_imei_is_stored_per_device_and_never_in_capability_state(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            with patch.multiple(device_state, ROOT=str(root),
+                                DESIRED=str(root / "desired.json"),
+                                STATUS=str(root / "status.json"),
+                                HARDWARE=str(root / "hardware.json")):
+                device_state.set_desired("reader-a", vowifi_enabled=True)
+                value = device_state.set_hardware("reader-a", {
+                    "device_type": "reader", "imei": "490154203237518"})
+                self.assertEqual(value["imei"], "490154203237518")
+                self.assertNotIn("imei", device_state.desired()["devices"]["reader-a"])
+                self.assertEqual(device_state.hardware()["reader-a"]["device_type"], "reader")
+
+    def test_vpcd_reader_name_preserves_modem_identity_without_metadata(self):
+        name = "VoWiFi Modem 2c7c-0125-1-1.2 00 03"
+        self.assertEqual(device_state.vpcd_modem_hardware_id(name), "2c7c-0125-1-1.2")
+        self.assertEqual(device_state.vpcd_modem_hardware_id(
+            "SCR Prime CCID Reader (000000000001) 00 00"), "")
+
+    def test_native_readers_exclude_orchestrator_vpcd_slots(self):
+        cards = [
+            {"name": "VoWiFi Modem 2c7c-0125-1-1.2 00 00", "hardware_kind": "reader"},
+            {"name": "SCR Prime CCID Reader (000000000001) 00 00",
+             "hardware_kind": "reader", "reader_port": "1-1.5"},
+        ]
+        readers = device_state.native_reader_devices(cards)
+        self.assertEqual(len(readers), 1)
+        self.assertEqual(next(iter(readers.values()))["reader_port"], "1-1.5")
+
+    def test_forgetting_hardware_and_preferences_is_scoped_to_one_device(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            with patch.multiple(device_state, ROOT=str(root),
+                                DESIRED=str(root / "desired.json"),
+                                STATUS=str(root / "status.json"),
+                                HARDWARE=str(root / "hardware.json")):
+                for device_id in ("a", "b"):
+                    device_state.set_desired(device_id, vowifi_enabled=True)
+                    device_state.set_hardware(device_id, {"device_type": "reader"})
+                self.assertTrue(device_state.remove_desired("a"))
+                self.assertTrue(device_state.remove_hardware("a"))
+                self.assertNotIn("a", device_state.desired()["devices"])
+                self.assertNotIn("a", device_state.hardware())
+                self.assertIn("b", device_state.desired()["devices"])
+                self.assertIn("b", device_state.hardware())
+
+    def test_all_eight_per_device_capability_combinations(self):
+        cases = (
+            # flight, cellular preference, VoWiFi, RF, effective data, bridge
+            (False, False, False, True, False, False),
+            (False, False, True,  True, False, True),
+            (False, True,  False, True, True,  False),
+            (False, True,  True,  True, True,  True),
+            (True,  False, False, False, False, False),
+            (True,  False, True,  False, False, True),
+            (True,  True,  False, False, False, False),
+            (True,  True,  True,  False, False, True),
+        )
+        for flight, cellular, vowifi, radio, data, bridge in cases:
+            with self.subTest(flight=flight, cellular=cellular, vowifi=vowifi):
+                plan = Orchestrator.device_capability_plan({
+                    "flight_mode": flight, "cellular_enabled": cellular,
+                    "vowifi_enabled": vowifi})
+                self.assertEqual(plan["radio_enabled"], radio)
+                self.assertEqual(plan["cellular_data_requested"], cellular)
+                self.assertEqual(plan["cellular_data_enabled"], data)
+                self.assertEqual(plan["vowifi_bridge_enabled"], bridge)
+
+                aggregate = Orchestrator.capability_plan({"m": {
+                    "flight_mode": flight, "cellular_enabled": cellular,
+                    "vowifi_enabled": vowifi}})
+                self.assertTrue(aggregate["cellular_backend_required"])
+                self.assertEqual(aggregate["country_egress_required"], vowifi)
+                self.assertEqual(aggregate["vowifi_devices"], ["m"] if bridge else [])
+                self.assertEqual(aggregate["effective_cellular_devices"], ["m"] if data else [])
+                self.assertEqual(aggregate["flight_mode_devices"], ["m"] if flight else [])
+                self.assertEqual(aggregate["radio_enabled_devices"], ["m"] if radio else [])
+
+    def test_native_reader_line_keeps_country_egress_without_a_usb_modem(self):
+        empty_modem_plan = Orchestrator.capability_plan({})
+        self.assertTrue(Orchestrator.country_egress_required({
+            "lines": [{"id": "reader-line", "enabled": True}]
+        }, empty_modem_plan))
+        self.assertFalse(Orchestrator.country_egress_required({
+            "lines": [{"id": "reader-line", "enabled": False}]
+        }, empty_modem_plan))
+
+    def test_any_cellular_device_forces_all_vowifi_bridges_through_mm(self):
+        plan = Orchestrator.capability_plan({
+            "cellular-only": {"cellular_enabled": True, "vowifi_enabled": False},
+            "vowifi-only": {"cellular_enabled": False, "vowifi_enabled": True},
+        })
+        self.assertTrue(plan["vowifi_through_modemmanager"])
+        self.assertEqual(plan["vowifi_devices"], ["vowifi-only"])
+
+    def test_multi_modem_effective_states_remain_independent(self):
+        plan = Orchestrator.capability_plan({
+            "flight-vowifi": {"flight_mode": True, "cellular_enabled": True,
+                              "vowifi_enabled": True},
+            "cellular-only": {"flight_mode": False, "cellular_enabled": True,
+                              "vowifi_enabled": False},
+        })
+        self.assertEqual(plan["cellular_devices"], ["cellular-only", "flight-vowifi"])
+        self.assertEqual(plan["effective_cellular_devices"], ["cellular-only"])
+        self.assertEqual(plan["flight_mode_devices"], ["flight-vowifi"])
+        self.assertEqual(plan["vowifi_devices"], ["flight-vowifi"])
+
+    def test_cellular_profile_is_stable_and_unique_per_physical_device(self):
+        first = Orchestrator.cellular_profile_name("2c7c-0125-1-1.2")
+        self.assertEqual(first, Orchestrator.cellular_profile_name("2c7c-0125-1-1.2"))
+        self.assertNotEqual(first, Orchestrator.cellular_profile_name("2c7c-0125-1-1.3"))
+        self.assertTrue(first.startswith("mdd-cell-"))
+
+    def test_native_cellular_plan_scales_per_physical_modem(self):
+        plan = Orchestrator.capability_plan({
+            "modem-a": {"cellular_enabled": True, "vowifi_enabled": False},
+            "modem-b": {"cellular_enabled": True, "vowifi_enabled": True},
+        })
+        self.assertTrue(plan["cellular_backend_required"])
+        self.assertEqual(plan["cellular_devices"], ["modem-a", "modem-b"])
+
+    def test_modem_snapshot_is_scoped_to_its_mm_object_and_bearer(self):
+        with tempfile.TemporaryDirectory() as temp:
+            app = Orchestrator(Path(temp) / "data", Path(temp), dry_run=True)
+            modem_detail = """modem.generic.primary-port : cdc-wdm1
+modem.generic.sim : /org/freedesktop/ModemManager1/SIM/7
+modem.generic.own-numbers.value[1] : +1 (202) 555-0100
+modem.generic.ports.value[1] : cdc-wdm1 (qmi)
+modem.generic.ports.value[2] : wwan1 (net)
+modem.generic.state : connected
+modem.generic.power-state : on
+modem.generic.signal-quality.value : 77
+modem.3gpp.operator-name : Example
+modem.3gpp.registration-state : roaming
+modem.generic.bearers.value[1] : /org/freedesktop/ModemManager1/Bearer/9
+"""
+            bearer = """bearer.status.connected : yes
+bearer.properties.apn : internet
+bearer.ipv4-config.address : 10.9.0.2
+bearer.stats.rx-bytes : 123
+bearer.stats.tx-bytes : 456
+"""
+            def fake_run(args, **_kwargs):
+                if args[:2] == ["mmcli", "-m"]:
+                    return SimpleNamespace(returncode=0, stdout=modem_detail, stderr="")
+                if args[:2] == ["mmcli", "-i"]:
+                    return SimpleNamespace(returncode=0,
+                                           stdout="sim.properties.iccid : 8901000000000000001\n",
+                                           stderr="")
+                if args[:2] == ["mmcli", "-b"]:
+                    return SimpleNamespace(returncode=0, stdout=bearer, stderr="")
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            with patch.object(app, "modemmanager_modem_for_tty",
+                              return_value="/org/freedesktop/ModemManager1/Modem/4"), patch(
+                                  "host.mdd_orchestrator.run", side_effect=fake_run):
+                value = app.modem_snapshot({"id": "modem-b", "tty": "/dev/ttyUSB6"})
+            self.assertTrue(value["data_active"])
+            self.assertTrue(value["radio_enabled"])
+            self.assertEqual(value["primary_port"], "cdc-wdm1")
+            self.assertEqual(value["network_interface"], "wwan1")
+            self.assertEqual(value["apn"], "internet")
+            self.assertEqual(value["rx_bytes"], 123)
+            self.assertEqual(value["msisdn"], "+12025550100")
+            self.assertEqual(value["sim_iccid"], "8901000000000000001")
+
+    def test_modem_number_normalization_rejects_placeholders_and_status_text(self):
+        self.assertEqual(Orchestrator.normalize_msisdn("--"), "")
+        self.assertEqual(Orchestrator.normalize_msisdn("not available"), "")
+        self.assertEqual(Orchestrator.normalize_msisdn("+44 7700-900123"), "+447700900123")
+
+    def test_modem_snapshot_retains_apn_from_disconnected_bearer(self):
+        with tempfile.TemporaryDirectory() as temp:
+            app = Orchestrator(Path(temp) / "data", Path(temp), dry_run=True)
+            modem_detail = """modem.generic.primary-port : cdc-wdm0
+modem.generic.state : registered
+modem.generic.power-state : on
+modem.3gpp.registration-state : home
+modem.generic.bearers.value[1] : /org/freedesktop/ModemManager1/Bearer/1
+"""
+            bearer = """bearer.status.connected : no
+bearer.properties.apn : carrier-apn
+"""
+
+            def fake_run(args, **_kwargs):
+                value = bearer if args[:2] == ["mmcli", "-b"] else modem_detail
+                return SimpleNamespace(returncode=0, stdout=value, stderr="")
+
+            with patch.object(app, "modemmanager_modem_for_tty", return_value="0"), patch(
+                    "host.mdd_orchestrator.run", side_effect=fake_run):
+                value = app.modem_snapshot({"id": "modem-a", "tty": "/dev/ttyUSB2"})
+            self.assertFalse(value["data_active"])
+            self.assertTrue(value["radio_enabled"])
+            self.assertEqual(value["apn"], "carrier-apn")
+
+    def test_modemmanager_disabled_state_is_flight_mode_even_if_hardware_power_is_on(self):
+        with tempfile.TemporaryDirectory() as temp:
+            app = Orchestrator(Path(temp) / "data", Path(temp), dry_run=True)
+            detail = """modem.generic.primary-port : cdc-wdm0
+modem.generic.state : disabled
+modem.generic.power-state : on
+modem.3gpp.registration-state : unknown
+"""
+            with patch.object(app, "modemmanager_modem_for_tty", return_value="0"), patch(
+                    "host.mdd_orchestrator.run",
+                    return_value=SimpleNamespace(returncode=0, stdout=detail, stderr="")):
+                value = app.modem_snapshot({"id": "modem-a", "tty": "/dev/ttyUSB2"})
+            self.assertTrue(value["powered"])
+            self.assertFalse(value["radio_enabled"])
+
+    def test_missing_device_state_gets_safe_native_defaults(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            app = Orchestrator(root / "data", root, dry_run=True)
+            devices, created = app.desired_devices([{"id": "modem-a"}])
+            self.assertTrue(created)
+            self.assertEqual(devices["modem-a"], {
+                "cellular_enabled": False, "vowifi_enabled": True,
+                "flight_mode": False})
+            document = device_state._read(str(app.device_desired_path), {})
+            self.assertEqual(document["version"], 2)
+            self.assertNotIn("mode", document)
+
+    def test_disabling_one_vowifi_bridge_preserves_the_other(self):
+        class Process:
+            def __init__(self, command):
+                self.command = command
+                self.running = True
+
+            def poll(self):
+                return None if self.running else 0
+
+            def terminate(self):
+                self.running = False
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            app = Orchestrator(root / "data", root, dry_run=False)
+            app.root.mkdir(parents=True)
+            modems = [
+                {"id": "a", "name": "A", "tty": "/dev/a"},
+                {"id": "b", "name": "B", "tty": "/dev/b"},
+            ]
+            hardware = {"auto_detect": True, "vpcd_slots": 3}
+            processes = []
+
+            def spawn(command):
+                process = Process(command)
+                processes.append(process)
+                return process
+
+            with patch.object(app, "usb_modems", return_value=modems), patch(
+                    "host.mdd_orchestrator.run",
+                    return_value=SimpleNamespace(returncode=0, stdout="", stderr="")), patch(
+                    "host.mdd_orchestrator.subprocess.Popen", side_effect=spawn), patch.dict(
+                    "os.environ", {"MDD_VPCD_READER_CONFIG": str(root / "readers.conf")}):
+                app.reconcile_hardware({"hardware": hardware}, {
+                    "a": {"vowifi_enabled": True}, "b": {"vowifi_enabled": True}})
+                bridge_b = app.bridges["b"]
+                app.reconcile_hardware({"hardware": hardware}, {
+                    "a": {"vowifi_enabled": False}, "b": {"vowifi_enabled": True}})
+
+            self.assertNotIn("a", app.bridges)
+            self.assertIs(app.bridges["b"], bridge_b)
+            self.assertTrue(bridge_b.running)
+            self.assertEqual(len(processes), 2)
+
+    def test_orchestrator_stop_marks_pcsc_maintenance_immediately(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            app = Orchestrator(root / "data", root, dry_run=True)
+            app.bridges["modem-a"] = SimpleNamespace()
+
+            app.request_stop()
+
+            marker = app.root / "pcsc-maintenance"
+            self.assertTrue(app.stop)
+            self.assertTrue(marker.is_file())
+            self.assertLessEqual(abs(time.time() - int(marker.read_text())), 2)
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class ReaderRecordMigrationTests(unittest.TestCase):
+    """A reader's id comes from its USB port, so moving it to a hub mints a new one and
+    strands the old record — rendering a connected reader twice, once permanently offline."""
+
+    NAME = "SCR Prime CCID Reader (000000000001) 00 00"
+
+    def setUp(self):
+        self._temp = tempfile.TemporaryDirectory()
+        self._patch = patch.object(
+            device_state, "HARDWARE",
+            str(Path(self._temp.name) / "devices-hardware.json"))
+        self._patch.start()
+
+    def tearDown(self):
+        self._patch.stop()
+        self._temp.cleanup()
+
+    def test_the_record_follows_the_reader_to_its_new_port(self):
+        device_state.set_hardware("reader-old", {
+            "device_type": "reader", "name": self.NAME,
+            "imei": "860349057116642", "stable_path": "1-1.5"})
+        moved = device_state.migrate_reader_records(
+            {"reader-new": {"name": self.NAME, "reader_port": "1-1.4.1"}})
+
+        self.assertEqual(moved, [("reader-old", "reader-new")])
+        records = device_state.hardware()
+        self.assertEqual(set(records), {"reader-new"})
+        # The IMEI is what the line presents to the carrier and is refreshed from here on
+        # every start; losing it would silently change the device identity.
+        self.assertEqual(records["reader-new"]["imei"], "860349057116642")
+        self.assertEqual(records["reader-new"]["stable_path"], "1-1.4.1")
+
+    def test_an_unplugged_reader_keeps_its_record(self):
+        device_state.set_hardware("reader-old", {
+            "device_type": "reader", "name": self.NAME, "imei": "860349057116642"})
+        self.assertEqual(device_state.migrate_reader_records({}), [])
+        self.assertIn("reader-old", device_state.hardware())
+
+    def test_an_ambiguous_set_is_left_for_a_person(self):
+        # Two identical readers replugged at once cannot be told apart by name.
+        device_state.set_hardware("reader-a", {"device_type": "reader", "name": self.NAME})
+        device_state.set_hardware("reader-b", {"device_type": "reader", "name": self.NAME})
+        self.assertEqual(device_state.migrate_reader_records(
+            {"reader-c": {"name": self.NAME}}), [])
+        self.assertEqual(set(device_state.hardware()), {"reader-a", "reader-b"})
+
+    def test_a_reader_that_did_not_move_is_untouched(self):
+        device_state.set_hardware("reader-a", {"device_type": "reader", "name": self.NAME})
+        self.assertEqual(device_state.migrate_reader_records(
+            {"reader-a": {"name": self.NAME}}), [])
+        self.assertIn("reader-a", device_state.hardware())
+
+    def test_a_modem_record_is_never_claimed_by_a_reader(self):
+        device_state.set_hardware("2c7c-0125-1-1.4",
+                                  {"device_type": "modem", "name": self.NAME})
+        self.assertEqual(device_state.migrate_reader_records(
+            {"reader-new": {"name": self.NAME}}), [])
+        self.assertIn("2c7c-0125-1-1.4", device_state.hardware())
