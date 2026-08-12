@@ -43,8 +43,8 @@ logs/
 # Screenshots (may contain sensitive info)
 screenshots/
 
-# Tests (optional, keep for development)
-# tests/
+# Tests
+tests/
 
 # Local config
 control/.venv/
