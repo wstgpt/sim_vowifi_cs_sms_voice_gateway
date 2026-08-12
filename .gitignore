@@ -30,6 +30,7 @@ Thumbs.db
 # Data files (contain sensitive info)
 data/
 !.gitkeep
+!.gitkeep
 
 # Logs
 *.log
