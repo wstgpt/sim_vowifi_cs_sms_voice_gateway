@@ -1,14 +1,23 @@
 """
-engine.py - Per-SIM engine container lifecycle via the Docker SDK.
+engine.py - Per-SIM engine lifecycle manager.
 
-Each instance runs one `mdd-sim-gateway/engine` container that owns its ePDG tunnel + Asterisk.
-The manager renders instance.json, starts/stops/recreates the container with the right
-mounts/caps/ports, and reads the engine's runtime status files (bind-mounted run dir):
-the swu_ike daemon publishes swu_status.json {state: CONNECTED} for tunnel state.
+Supports two modes:
+- Docker mode (default): Each instance runs in a Docker container
+- Native mode (MDD_ENGINE_MODE=native): Runs as host processes
 
-PC/SC: engine containers are pcscd CLIENTS — they mount the HOST pcscd socket (/run/pcscd).
-The pcsc-lite client library in the engine image is pinned to the SAME version as the host
-pcscd (Dockerfile PCSC_VERSION == install.sh PCSC_VERSION) so client/server protocol matches.
+The engine consists of:
+1. pin_keeper.py - Holds SIM PIN verification
+2. swu_ike.py - SWu (ePDG) IKEv2/IPsec tunnel
+3. ami_usim.py - USIM<->AMI bridge for IMS authentication
+4. Asterisk - SIP/IMS stack
+
+Runtime files (bind-mounted in Docker, local in native):
+- run/swu_status.json - Tunnel state {state: CONNECTED}
+- run/pin_status.json - PIN state
+- run/usim_status.json - USIM state
+- run/pcscf - Discovered P-CSCF address
+- run/charon.log - IKE tunnel log
+- logs/ - Asterisk logs
 """
 from __future__ import annotations
 
@@ -18,10 +27,16 @@ import logging
 import os
 import re
 import shutil
+import subprocess
 import threading
 import time
+from pathlib import Path
 
-import docker
+try:
+    import docker
+    HAS_DOCKER = True
+except ImportError:
+    HAS_DOCKER = False
 
 from . import config as cfg, egress, sysinfo
 
@@ -51,7 +66,7 @@ _DEBUG_LINE = re.compile(r"\bDEBUG\b")
 _DISPLAY_TIMESTAMP = re.compile(
     r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}[+-]\d{4}\] ")
 _DOCKER_TIMESTAMP = re.compile(
-    r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.\d+)?(Z|[+-]\d{2}:\d{2}) (.*)$")
+    r"^(\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2})(?:\\.\\d+)?(Z|[+-]\\d{2}:\\d{2}) (.*)$")
 _ASTERISK_TIMESTAMP = re.compile(r"^\[[A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\]\s*")
 # Enough to cover a full REGISTER exchange plus the failures around it.
 SIP_EVIDENCE_LINES = 40
@@ -64,6 +79,9 @@ PCSCD_SOCK = os.environ.get("MDD_PCSCD_DIR", "/run/pcscd")
 HOST_DATA_DIR = os.environ.get("MDD_HOST_DATA", DATA_DIR)
 MANAGED_LABEL = "io.mdd-sim-gateway.managed"
 
+# Engine mode: "docker" (default) or "native"
+ENGINE_MODE = os.environ.get("MDD_ENGINE_MODE", "docker").lower()
+
 
 def _owned(container) -> bool:
     labels = (container.attrs.get("Config") or {}).get("Labels") or {}
@@ -72,12 +90,7 @@ def _owned(container) -> bool:
 
 
 def _host_data_path(path: str) -> str:
-    """Translate a control-container path under MDD_DATA to the same file on the host.
-
-    Explicit TLS files are configured from the WebUI as /data/... in Docker mode. Sibling
-    engine containers cannot bind-mount that container-only path; Docker needs the host's
-    /opt/... data path instead. Paths outside DATA_DIR are already host/native paths.
-    """
+    """Translate a control-container path under MDD_DATA to the same file on the host."""
     absolute = os.path.abspath(path)
     data_root = os.path.abspath(DATA_DIR)
     try:
@@ -89,12 +102,7 @@ def _host_data_path(path: str) -> str:
 
 
 def _runtime_data_path(path: str) -> str:
-    """Translate a TLS path persisted while the manager used Docker's /data mount.
-
-    The native control plane and sibling engine both use the host data directory.  Without this
-    migration, the WebUI can have the public certificate while Asterisk silently falls back to
-    an old self-signed certificate, causing browsers to reject the softphone WSS connection.
-    """
+    """Translate a TLS path persisted while the manager used Docker's /data mount."""
     value = str(path or "")
     if value.startswith("/data/") and os.path.abspath(DATA_DIR) != "/data":
         translated = os.path.join(DATA_DIR, os.path.relpath(value, "/data"))
@@ -142,12 +150,7 @@ def _instance_paths(iid: str):
 
 
 def _clear_runtime_state(base: str):
-    """Remove observations owned by the previous engine process.
-
-    Runtime files are bind-mounted outside the container and therefore survive a container
-    recreation.  Keeping an old CONNECTED marker makes the new process look online before it
-    has completed IKE and IMS registration.
-    """
+    """Remove observations owned by the previous engine process."""
     run_dir = os.path.join(base, "run")
     for name in ("swu_status.json", "pcscf", "pcscf.applied", "pin_status.json",
                  "usim_status.json", "engine.env", "swu.ctl"):
@@ -166,11 +169,7 @@ def _tail_lines(path: str, limit: int) -> list[str]:
 
 
 def _charon_evidence(base: str) -> dict:
-    """Summarise IKE health from the tunnel log.
-
-    Retransmits and outright IKE timeouts are the signature of a lossy country exit, which
-    looks identical to a carrier problem from the status machine's point of view.
-    """
+    """Summarise IKE health from the tunnel log."""
     lines = _tail_lines(os.path.join(base, "run", "charon.log"), 400)
     last_state = ""
     for line in reversed(lines):
@@ -184,11 +183,7 @@ def _charon_evidence(base: str) -> dict:
 
 
 def ike_evidence(iid: str) -> dict:
-    """Retransmit/timeout counts for one line, without building a whole diagnostic snapshot.
-
-    The failover policy needs to know whether the tunnel's own signalling was answered; it
-    runs on the freeze path, where reading the container's logs would be far too heavy.
-    """
+    """Retransmit/timeout counts for one line, without building a whole diagnostic snapshot."""
     base, _host_base = _instance_paths(str(iid))
     return _charon_evidence(base)
 
@@ -246,23 +241,13 @@ def _append_diagnostic(base: str, record: dict):
 
 
 def capture_diagnostics(iid: str, inst: dict, base: str, reason: str):
-    """Persist the evidence that recreating the container is about to destroy.
-
-    Container logs and Asterisk's live registration view disappear with ``remove()``. A line
-    stuck in the health policy's rebuild loop destroys its own evidence every couple of
-    minutes, which is precisely when that evidence is needed. Never raises: a failed capture
-    must not block the rebuild it is documenting.
-    """
+    """Persist the evidence that recreating the container is about to destroy."""
     try:
         record = {"ts": int(time.time()), "instance": str(iid), "reason": reason,
                   "registration": registration_state(iid),
                   "pcscf": read_pcscf(iid) or "",
                   "charon": _charon_evidence(base),
                   "egress": _egress_evidence(inst),
-                  # A brown-out takes out the USB-attached NIC, the modem and the reader at
-                  # once, and reaches the status machine as a tunnel that simply stopped
-                  # passing traffic. Recorded here so that cause is visible beside the effect
-                  # instead of being reconstructed from a shell session days later.
                   "host": _host_evidence()}
         for name in ("swu_status.json", "usim_status.json", "pin_status.json"):
             record[name[:-5]] = read_run_json(iid, name) or {}
@@ -272,23 +257,190 @@ def capture_diagnostics(iid: str, inst: dict, base: str, reason: str):
         log.warning("diagnostic capture failed for instance %s: %s", iid, exc)
 
 
+# ============================================================================
+# Native engine support
+# ============================================================================
+
+# Track native engine processes per instance
+_native_processes: dict[str, dict] = {}
+_native_lock = threading.Lock()
+
+
+def _native_start(iid: str, inst: dict, settings: dict) -> str:
+    """Start engine processes natively (no Docker)."""
+    base, _ = _instance_paths(iid)
+    run_dir = os.path.join(base, "run")
+    logs_dir = os.path.join(base, "logs")
+    
+    # Read instance config
+    instance_json = os.path.join(base, "instance.json")
+    if not os.path.exists(instance_json):
+        raise FileNotFoundError(f"instance.json not found: {instance_json}")
+    
+    with open(instance_json) as f:
+        config = json.load(f)
+    
+    env = os.environ.copy()
+    env.update({
+        "MDD_ID": iid,
+        "MDD_RUNDIR": run_dir,
+        "USIM_PIN": config.get("usim_pin", ""),
+        "USIM_READER": str(config.get("usim_reader", "0")),
+        "USIM_READER_INDEX": str(config.get("usim_reader_index", 0)),
+        "USIM_READER_PORT": str(config.get("usim_reader_port", 0)),
+        "USIM_IMSI": config.get("usim_imsi", ""),
+        "SWU_SOURCE": config.get("swu_source", "3gpp"),
+        "SWU_EPDG": config.get("swu_epdg", ""),
+        "SWU_APN": config.get("swu_apn", "ims"),
+        "SWU_MCC": config.get("swu_mcc", ""),
+        "SWU_MNC": config.get("swu_mnc", ""),
+        "SWU_IMEI": config.get("swu_imei", ""),
+        "SWU_IMEISV": config.get("swu_imeisv", ""),
+    })
+    
+    # Get paths to engine scripts
+    repo_dir = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+    engine_dir = os.path.join(repo_dir, "engine")
+    
+    scripts = {
+        "pin_keeper": os.path.join(engine_dir, "pin_keeper.py"),
+        "swu_ike": os.path.join(engine_dir, "swu_ike.py"),
+        "ami_usim": os.path.join(engine_dir, "ami_usim.py"),
+    }
+    
+    processes = {}
+    
+    # Start pin_keeper
+    if os.path.exists(scripts["pin_keeper"]):
+        cmd = ["python3", "-u", scripts["pin_keeper"]]
+        p = subprocess.Popen(cmd, env=env, 
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        processes["pin_keeper"] = p
+        time.sleep(0.5)  # Give it time to start
+    
+    # Start swu_ike with supervisor loop
+    if os.path.exists(scripts["swu_ike"]):
+        # Create log file
+        charon_log = os.path.join(run_dir, "charon.log")
+        with open(charon_log, "w") as f:
+            f.write("")
+        
+        cmd = [
+            "python3", "-u", scripts["swu_ike"],
+            "-m", str(config.get("usim_reader_index", 0)),
+            "-s", config.get("swu_source", "3gpp"),
+            "-d", config.get("swu_epdg", ""),
+            "-a", config.get("swu_apn", "ims"),
+            "-I", config.get("usim_imsi", ""),
+            "-M", config.get("swu_mcc", ""),
+            "-N", config.get("swu_mnc", ""),
+            "-E", config.get("swu_imei", ""),
+            "-V", config.get("swu_imeisv", ""),
+        ]
+        
+        # Run with log capture
+        log_capture = os.path.join(engine_dir, "log_capture.py")
+        if os.path.exists(log_capture):
+            cmd = [
+                "python3", "-u", log_capture,
+                "--current", charon_log,
+                "--archive-dir", os.path.join(logs_dir, "ike"),
+            ] + cmd
+        
+        p = subprocess.Popen(cmd, env=env,
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        processes["swu_ike"] = p
+        time.sleep(1)  # Give it time to establish tunnel
+    
+    # Start ami_usim
+    if os.path.exists(scripts["ami_usim"]) and os.path.exists("/usr/local/etc/ami_usim.ini"):
+        cmd = ["python3", "-u", scripts["ami_usim"], "/usr/local/etc/ami_usim.ini"]
+        p = subprocess.Popen(cmd, env=env,
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        processes["ami_usim"] = p
+        time.sleep(0.5)
+    
+    # Start Asterisk
+    cmd = ["asterisk", "-f"]
+    asterisk_log = os.path.join(logs_dir, "asterisk.log")
+    p = subprocess.Popen(cmd, env=env,
+                       stdout=open(asterisk_log, "w"), stderr=subprocess.STDOUT)
+    processes["asterisk"] = p
+    
+    # Store process info
+    with _native_lock:
+        _native_processes[iid] = {
+            "processes": processes,
+            "started_at": time.time(),
+            "base": base,
+        }
+    
+    log.info("started native engine for instance %s", iid)
+    return f"native-{iid}"
+
+
+def _native_stop(iid: str) -> bool:
+    """Stop native engine processes for an instance."""
+    with _native_lock:
+        info = _native_processes.pop(iid, None)
+    
+    if info:
+        for name, proc in info["processes"].items():
+            try:
+                proc.terminate()
+                proc.wait(timeout=5)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        log.info("stopped native engine for instance %s", iid)
+        return True
+    return False
+
+
+def _native_is_running(iid: str) -> bool:
+    """Check if native engine processes are running."""
+    with _native_lock:
+        info = _native_processes.get(iid)
+    
+    if not info:
+        return False
+    
+    for name, proc in info["processes"].items():
+        if proc.poll() is None:
+            return True
+    
+    return False
+
+
+# ============================================================================
+# Docker engine support (original)
+# ============================================================================
+
 def start(inst: dict, settings: dict, dev_mounts: bool = False, reason: str = "rebuild"):
-    """(Re)create and start the engine container for an instance."""
+    """(Re)create and start the engine for an instance."""
     iid = str(inst["id"])
-    # Fail closed before creating the container when country routing is enabled. The host-side
-    # orchestrator confirms that this carrier's outer ePDG address is routed through the selected
-    # country TUN; inner IMS/SIP/RTP then stays inside the resulting IPsec tunnel.
+    
+    # Fail closed before creating the container when country routing is enabled.
     egress.ensure_line(inst, settings)
     cfg.write_instance_json(inst, settings)
     base, host_base = _instance_paths(iid)
     ports = inst.get("ports", {})
+    
+    if ENGINE_MODE == "native":
+        return _native_start(iid, inst, settings)
+    
+    # Docker mode (original)
+    if not HAS_DOCKER:
+        raise RuntimeError("Docker not available")
+    
     client = _client()
     # remove any existing container
     try:
         old = client.containers.get(container_name(iid))
         if not _owned(old):
             raise RuntimeError(f"refusing to replace foreign container {old.name}")
-        # Only a replacement destroys evidence; a first start has none to keep.
         capture_diagnostics(iid, inst, base, reason)
         old.remove(force=True)
     except docker.errors.NotFound:
@@ -302,18 +454,9 @@ def start(inst: dict, settings: dict, dev_mounts: bool = False, reason: str = "r
         os.path.join(host_base, "run"): {"bind": "/run/mdd-sim-gateway", "mode": "rw"},
         PCSCD_SOCK: {"bind": "/run/pcscd", "mode": "rw"},
     }
-    # The image has no timezone, so every engine log (IKE, Asterisk) was stamped in UTC while
-    # the timeline, the WebUI and the operator's shell read local time. Correlating a rekey or
-    # a teardown with an outage meant doing the offset in your head. Give the container the
-    # host's zone; nothing parses these timestamps, so this is display only.
     if os.path.exists("/etc/localtime"):
         volumes["/etc/localtime"] = {"bind": "/etc/localtime", "mode": "ro"}
-    # TLS cert for the local SIP-TLS / WebRTC (WSS 8089) transport. An explicit cert in
-    # settings.tls wins; otherwise fall back to the control plane's own self-signed cert
-    # (generated by run.py under $MDD_DATA/certs) so the engine's WSS listener always has
-    # a cert — without it Asterisk fails to bind 8089 and the browser softphone can't connect.
-    # Bind-mounts must use the HOST path (engine is a sibling container); check existence via
-    # the in-container DATA_DIR but mount the HOST_DATA_DIR path.
+    
     tls = settings.get("tls", {})
     configured_cert = _runtime_data_path(tls.get("cert_path"))
     configured_key = _runtime_data_path(tls.get("key_path"))
@@ -323,15 +466,13 @@ def start(inst: dict, settings: dict, dev_mounts: bool = False, reason: str = "r
         cert_host = _host_data_path(configured_cert)
         key_host = _host_data_path(configured_key)
     else:
-        # self-signed pair written by run.py: $MDD_DATA/certs/self-signed.{crt,key}
         ss_crt = os.path.join(DATA_DIR, "certs", "self-signed.crt")
         ss_key = os.path.join(DATA_DIR, "certs", "self-signed.key")
         if os.path.exists(ss_crt) and os.path.exists(ss_key):
             cert_host = os.path.join(HOST_DATA_DIR, "certs", "self-signed.crt")
             key_host = os.path.join(HOST_DATA_DIR, "certs", "self-signed.key")
         else:
-            log.warning("no TLS cert available for engine %s WSS/8089 — browser softphone will "
-                        "not connect until a cert exists (control plane cert at %s missing)", iid, ss_crt)
+            log.warning("no TLS cert available for engine %s WSS/8089", iid)
     if cert_host and key_host:
         volumes[cert_host] = {"bind": "/etc/asterisk/certificate.crt", "mode": "ro"}
         volumes[key_host] = {"bind": "/etc/asterisk/certificate.key", "mode": "ro"}
@@ -344,15 +485,9 @@ def start(inst: dict, settings: dict, dev_mounts: bool = False, reason: str = "r
         volumes[os.path.join(eng, "entrypoint.sh")] = {"bind": "/entrypoint.sh", "mode": "ro"}
         volumes[os.path.join(eng, "templates")] = {"bind": "/opt/mdd-sim-gateway/templates", "mode": "ro"}
 
-    # Public edition: expose only the authenticated browser softphone transport. Standalone
-    # SIP UDP/TCP/TLS listeners are not published to the host.
     port_bindings = {f"{8089}/tcp": ports.get("webrtc", 8089)}
-    # AMI grants system/command/originate. The manager dials the container bridge directly, so a
-    # host mapping is unnecessary in normal operation and costs another docker-proxy. Keep the
-    # loopback-only mapping as an explicit diagnostic option.
     if (settings.get("debug") or {}).get("ami", False):
         port_bindings[f"{5038}/tcp"] = ("127.0.0.1", ports.get("ami", 5038))
-    # RTP range
     rtp_start = ports.get("rtp_start", 10000)
     for p in range(rtp_start, rtp_start + cfg.rtp_span(ports)):
         port_bindings[f"{p}/udp"] = p
@@ -379,13 +514,16 @@ def start(inst: dict, settings: dict, dev_mounts: bool = False, reason: str = "r
             "net.ipv6.conf.all.use_tempaddr": "0",
             "net.ipv6.conf.default.use_tempaddr": "0",
         },
-        extra_hosts={"host.docker.internal": "host-gateway"},  # so notify.py can reach the manager
+        extra_hosts={"host.docker.internal": "host-gateway"},
     )
     log.info("started engine container %s", c.name)
     return c.id
 
 
 def stop(iid: str, expected_container_id: str | None = None):
+    if ENGINE_MODE == "native":
+        return _native_stop(iid)
+    
     try:
         c = _client().containers.get(container_name(iid))
         if not _owned(c):
@@ -402,24 +540,20 @@ def stop(iid: str, expected_container_id: str | None = None):
 
 def capture_and_stop(iid: str, inst: dict, reason: str,
                      expected_container_id: str | None = None) -> bool:
-    """Snapshot a failing line, then remove its container.
-
-    The health policy gives up by stopping the container and only rebuilds it after a
-    cooldown, so by the time ``start()`` runs there is nothing left to read. This is the
-    path that destroys the evidence in practice, and it is also the exact moment worth
-    recording: the policy has just concluded the line cannot register.
-
-    Blocking (Docker exec + log read); callers on the event loop must use a worker thread.
-    """
+    """Snapshot a failing line, then remove its engine."""
     if expected_container_id:
-        try:
-            current = _client().containers.get(container_name(iid))
-            if not _owned(current):
-                raise RuntimeError(f"refusing to inspect foreign container {current.name}")
-            if str(current.id) != str(expected_container_id):
+        if ENGINE_MODE == "native":
+            if not _native_is_running(iid):
                 return False
-        except docker.errors.NotFound:
-            return False
+        else:
+            try:
+                current = _client().containers.get(container_name(iid))
+                if not _owned(current):
+                    raise RuntimeError(f"refusing to inspect foreign container {current.name}")
+                if str(current.id) != str(expected_container_id):
+                    return False
+            except docker.errors.NotFound:
+                return False
     base, _ = _instance_paths(iid)
     capture_diagnostics(iid, inst, base, reason)
     return (stop(iid, expected_container_id=expected_container_id)
@@ -428,6 +562,9 @@ def capture_and_stop(iid: str, inst: dict, reason: str,
 
 def delete_instance_data(iid: str) -> bool:
     """Remove one deleted line's rendered config, runtime markers and bounded logs."""
+    if ENGINE_MODE == "native":
+        _native_stop(iid)
+    
     root = os.path.realpath(os.path.join(DATA_DIR, "instances"))
     target = os.path.realpath(os.path.join(root, str(iid)))
     if os.path.dirname(target) != root:
@@ -439,11 +576,17 @@ def delete_instance_data(iid: str) -> bool:
 
 
 def is_running(iid: str) -> bool:
+    if ENGINE_MODE == "native":
+        return _native_is_running(iid)
     return container_runtime(iid)["running"]
 
 
 def container_runtime(iid: str) -> dict:
     """Return running state and bridge address from one Docker inspect operation."""
+    if ENGINE_MODE == "native":
+        running = _native_is_running(iid)
+        return {"running": running, "ip": None, "container_id": f"native-{iid}"}
+    
     try:
         c = _client().containers.get(container_name(iid))
         running = c.status == "running"
@@ -489,6 +632,17 @@ def tunnel_installed(iid: str) -> bool:
 
 
 def exec_cli(iid: str, command: str) -> str:
+    if ENGINE_MODE == "native":
+        # Run asterisk CLI directly
+        try:
+            result = subprocess.run(
+                ["asterisk", "-rx", command],
+                capture_output=True, text=True, timeout=10
+            )
+            return result.stdout
+        except Exception as e:
+            return f"error: {e}"
+    
     try:
         c = _client().containers.get(container_name(iid))
         rc, out = c.exec_run(["asterisk", "-rx", command])
@@ -498,30 +652,8 @@ def exec_cli(iid: str, command: str) -> str:
 
 
 def registration_state(iid: str) -> str:
-    """Read IMS registration through the local Asterisk CLI.
-
-    Some IMS-patched Asterisk builds accept AMI's PJSIPShowRegistrationsDetailed action but
-    never complete it. Treating that management timeout as a carrier failure eventually stops
-    an otherwise healthy line. The CLI is the authoritative local view and has proven reliable
-    on those same builds.
-    """
-    client = None
-    try:
-        # Use a short-lived client with an HTTP read timeout. Asterisk's remote CLI can block
-        # behind an IMS TCP connect; the normal shared helper intentionally has no global Docker
-        # timeout, so using it here would leave one worker thread behind on every status poll.
-        client = docker.from_env(timeout=5)
-        container = client.containers.get(container_name(iid))
-        rc, raw = container.exec_run(["asterisk", "-rx", "pjsip show registrations"])
-        output = raw.decode(errors="replace") if isinstance(raw, bytes) else str(raw)
-    except Exception:
-        return "unknown"
-    finally:
-        if client is not None:
-            try:
-                client.close()
-            except Exception:
-                pass
+    """Read IMS registration through the local Asterisk CLI."""
+    output = exec_cli(iid, "pjsip show registrations")
     if re.search(r"\bRejected\b", output, re.I):
         return "Rejected"
     if re.search(r"\bUnregistered\b", output, re.I):
@@ -551,15 +683,21 @@ def _format_docker_logs(raw: str, local_tz=None) -> str:
 
 
 def logs(iid: str, tail: int = 200, since=None) -> str:
+    if ENGINE_MODE == "native":
+        # Read from local log file
+        base, _ = _instance_paths(iid)
+        log_path = os.path.join(base, "logs", "asterisk.log")
+        try:
+            with open(log_path) as f:
+                lines = f.readlines()
+            return "".join(lines[-tail:])
+        except Exception as e:
+            return f"error: {e}"
+    
     try:
         c = _client().containers.get(container_name(iid))
-        # Docker records the emission time for every physical stdout/stderr line. Request that
-        # source timestamp rather than stamping at page-refresh time, then normalize it to the
-        # same local display format as charon.log.
         kwargs = {"tail": tail, "timestamps": True}
         if since is not None:
-            # docker SDK accepts an int (unix ts) or datetime; used by the SMS delivery
-            # watcher to read only the lines emitted after a send.
             kwargs["since"] = since
         raw = c.logs(**kwargs).decode(errors="replace")
         return _format_docker_logs(raw)
@@ -568,8 +706,7 @@ def logs(iid: str, tail: int = 200, since=None) -> str:
 
 
 def charon_log(iid: str, tail: int = 200) -> str:
-    """Recent SWu tunnel (IKE) log lines from the instance run dir. The file is named
-    charon.log for control-plane/WebUI compatibility (the log-view key is 'charon')."""
+    """Recent SWu tunnel (IKE) log lines from the instance run dir."""
     path = os.path.join(DATA_DIR, "instances", str(iid), "run", "charon.log")
     try:
         with open(path, errors="replace") as f:

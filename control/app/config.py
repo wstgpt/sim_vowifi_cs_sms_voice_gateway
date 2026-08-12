@@ -48,6 +48,10 @@ DEFAULTS = {
         "debug": {"asterisk": False, "charon": False, "pcap": False, "ami": False},
         "manager_url": "",          # reachable URL engines POST events to (auto if empty)
         "retry": {"max": 3, "interval": 30},   # auto-retry attempts + seconds per attempt
+        # Engine mode: "docker" (default, requires Docker) or "native" (uses system Asterisk)
+        # Native mode is lighter weight, no Docker required for engines.
+        # Docker mode is the original implementation, better isolation.
+        "engine_mode": "docker",
         # Proactive IKEv2 SA rekey. IKEv2 does NOT negotiate SA lifetime on the wire (RFC 7296
         # dropped it), so rekey timing is local policy (3GPP TS 24.302 clause 7.2.2C: use a
         # configured value, else an implementation value). We rekey the CHILD (ESP) SA every

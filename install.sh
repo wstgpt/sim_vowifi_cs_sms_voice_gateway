@@ -35,7 +35,8 @@
 #   MDD_DATA_DIR        runtime data dir                           (default <repo>/data)
 #   MDD_ADVERTISE_ADDR  host LAN IP for SIP/WebRTC media           (default: auto-detect)
 #   MDD_BIND            control bind addr                          (default 0.0.0.0)
-#   MDD_ENGINE_BASE_IMAGE optional trusted local engine image for an offline overlay migration
+# MDD_ENGINE_MODE     engine mode: docker | native               (default docker)
+# MDD_ENGINE_BASE_IMAGE optional trusted local engine image for an offline overlay migration
 #   MDD_REUSE_WEBUI     set to 1 to reuse a prebuilt, reviewed webui/dist in an offline install
 #   PCSC_VERSION           pinned pcsc-lite version                   (default 2.3.3)
 #   LPAC_SRC               optional path to lpac source (for build-lpac)
@@ -141,6 +142,28 @@ host_arch() {
     aarch64|arm64) printf '%s' arm64 ;;
     *) die "unsupported CPU architecture: $(uname -m)" ;;
   esac
+}
+
+ensure_asterisk() {
+  # Ensure Asterisk is available for native engine mode
+  if [ \"${MDD_ENGINE_MODE:-docker}\" = \"native\" ]; then
+    if have asterisk; then
+      info \"Asterisk $(asterisk -rvx 'core show version' 2>/dev/null | head -1) already installed\"
+      return 0
+    fi
+    info \"installing Asterisk from system packages…\"
+    if have apt-get; then
+      pkg_install asterisk asterisk-pjsip asterisk-mp3
+    elif have dnf || have yum; then
+      pkg_install asterisk asterisk-pjsip
+    elif have pacman; then
+      pkg_install asterisk
+    else
+      die \"Asterisk not found and cannot be installed. Install it manually or use Docker mode.\"
+    fi
+    have asterisk || die \"Asterisk installation failed\"
+    info \"Asterisk installed\"
+  fi
 }
 
 ensure_singbox() {
@@ -296,8 +319,8 @@ resolve_mode() {
   [ -z "$m" ] && [ -f "$MODE_STATE" ] && m=$(cat "$MODE_STATE" 2>/dev/null || true)
   [ -z "$m" ] && m="local"
   case "$m" in
-    local|docker) ;;
-    *) die "invalid deploy mode '$m' (use: local | docker)";;
+    local|docker|native) ;;
+    *) die "invalid deploy mode '$m' (use: local | docker | native)";;
   esac
   MODE="$m"
 }
@@ -313,6 +336,12 @@ control_running() {
 
 # ------------------------------------------------------------------ prerequisites
 ensure_docker() {
+  # Native engine mode doesn't require Docker for engines, only for control plane if needed
+  if [ "${MDD_ENGINE_MODE:-docker}" = "native" ]; then
+    info "native engine mode — Docker not required for engines"
+    return 0
+  fi
+  
   if have docker && docker info >/dev/null 2>&1; then
     info "Docker present ($(docker --version | awk '{print $3}' | tr -d ,))"
     return
@@ -819,17 +848,27 @@ cmd_install() {
   need_root
   resolve_mode
   info "MDD Sim Gateway install — repo: $REPO_DIR  (mode: ${B}$MODE${N})"
-  # The engine image compiles Asterisk + pcsc-lite + the Python SWu tunnel deps from source. On
-  # low-power ARM boards (Raspberry Pi, Armbian SBCs) this first build can take 20-30 minutes —
-  # only once, since later installs reuse the built image. Warn up front so a long, quiet build
-  # isn't mistaken for a hang.
-  ensure_docker
-  docker_preflight
-  if ! docker image inspect "$ENGINE_IMAGE" >/dev/null 2>&1; then
-    warn "the engine image builds from source (Asterisk + pcsc-lite + SWu tunnel deps). On low-power ARM"
-    warn "machines this can take 20-30 minutes — this is normal, please be patient. It runs only once;"
-    warn "later installs/reloads reuse the built image."
+  
+  # Engine mode: docker or native
+  ENGINE_MODE="${MDD_ENGINE_MODE:-docker}"
+  if [ "$ENGINE_MODE" = "native" ]; then
+    info "using NATIVE engine mode (no Docker required for engines)"
   fi
+  
+  # In native mode, use system Asterisk instead of building Docker image
+  if [ "$ENGINE_MODE" = "native" ]; then
+    ensure_asterisk
+  else
+    # Docker mode: ensure Docker and build engine image
+    ensure_docker
+    docker_preflight
+    if ! docker image inspect "$ENGINE_IMAGE" >/dev/null 2>&1; then
+      warn "the engine image builds from source (Asterisk + pcsc-lite + SWu tunnel deps). On low-power ARM"
+      warn "machines this can take 20-30 minutes — this is normal, please be patient. It runs only once;"
+      warn "later installs/reloads reuse the built image."
+    fi
+  fi
+  
   ensure_pcscd
   ensure_singbox
   ensure_cellular_tools
@@ -838,7 +877,14 @@ cmd_install() {
   else
     info "lpac already installed at $MDD_DATA_DIR/lpac/lpac"
   fi
-  ensure_engine_image
+  
+  # Only build engine image in Docker mode
+  if [ "$ENGINE_MODE" != "native" ]; then
+    ensure_engine_image
+  else
+    info "skipping engine image build (native mode)"
+  fi
+  
   persist_mode "$MODE"
   if [ "$MODE" = docker ]; then
     setup_venv
@@ -854,11 +900,16 @@ cmd_install() {
   DATA_ABS=$(data_dir_abs)
   LAN_IP="${MDD_ADVERTISE_ADDR:-$(detect_lan_ip)}"
   printf '\n'
-  info "install complete (mode: $MODE)"
+  info "install complete (mode: $MODE, engine: $ENGINE_MODE)"
   printf '   %sWebUI:%s   https://%s:%s\n' "$B" "$N" "${LAN_IP:-<host-ip>}" "$MDD_PORT"
   printf '   %sData:%s    %s\n' "$B" "$N" "$DATA_ABS"
   if [ "$MODE" = local ]; then
-    printf '   %sControl:%s native systemd service (mdd-sim-gateway-control); engines run in Docker\n' "$B" "$N"
+    printf '   %sControl:%s native systemd service (mdd-sim-gateway-control)' "$B" "$N"
+    if [ "$ENGINE_MODE" = "native" ]; then
+      printf '; engines run natively\n'
+    else
+      printf '; engines run in Docker\n'
+    fi
   else
     printf '   %sControl:%s Docker container (%s); engines run in Docker\n' "$B" "$N" "$CONTROL_NAME"
   fi
